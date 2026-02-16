@@ -15,6 +15,14 @@ from machinegnostics.magcal import ELDF, EGDF, QLDF, QGDF, DataCluster
 from machinegnostics.metrics.std import std
 from machinegnostics.magcal.util.logging import get_logger
 
+def _fit_and_get_z0(datum, data, gdf_type, kwargs):
+    """Standalone worker for parallel Z0 computation."""
+    extended_data = np.append(data, datum)
+    gdf_new = gdf_type(**kwargs)
+    gdf_new.fit(data=extended_data, plot=False)
+    return datum, float(gdf_new.z0)
+
+
 class DataIntervals:
     """
     Robust Interval Estimation Engine for GDF Classes
@@ -136,7 +144,9 @@ class DataIntervals:
                  gnostic_filter: bool = False,
                  catch: bool = True,
                  verbose: bool = False,
-                 flush: bool = False):
+                 flush: bool = False,
+                 parallel: bool = False,
+                 max_workers: int = None):
         self.gdf = gdf
         self.n_points = n_points
         self.dense_zone_fraction = np.clip(dense_zone_fraction, 0.1, 0.8)
@@ -150,6 +160,8 @@ class DataIntervals:
         self.catch = catch
         self.verbose = verbose
         self.flush = flush
+        self.parallel = parallel
+        self.max_workers = max_workers
         self.params: Dict = {}
         self.params['errors'] = []
         self.params['warnings'] = []
@@ -360,8 +372,14 @@ class DataIntervals:
 
     def _scan_intervals(self):
         self.logger.info("Scanning intervals by extending data...")
+        if self.parallel:
+            self._scan_intervals_parallel()
+        else:
+            self._scan_intervals_sequential()
+
+    def _scan_intervals_sequential(self):
         try:
-            self.logger.info("Scanning intervals...")
+            self.logger.info("Scanning intervals (sequential)...")
 
             # Scan lower direction (Z0 -> LB)
             lower_points = self._generate_search_points('lower')
@@ -371,7 +389,7 @@ class DataIntervals:
                 self.search_results['datum'].append(datum)
                 self.search_results['z0'].append(z0_val)
                 self.search_results['success'].append(True)
-                if self.verbose and i % (self.n_points/10) == 0:
+                if self.verbose and i % max(1, self.n_points // 10) == 0:
                     self.logger.info(f"    Lower scan [{i}/{len(lower_points)}]: Datum={datum:.4f}, Z0={z0_val:.6f}")
                 if self._check_convergence():
                     if self.verbose:
@@ -397,6 +415,55 @@ class DataIntervals:
             self._add_error(f"Scanning intervals failed: {e}")
             return
 
+    def _scan_intervals_parallel(self):
+        import concurrent.futures
+
+        try:
+            self.logger.info("Scanning intervals (parallel)...")
+
+            lower_points = self._generate_search_points('lower')
+            upper_points = self._generate_search_points('upper')
+            all_points = np.concatenate([lower_points, upper_points])
+
+            kwargs = self._build_sub_fit_kwargs()
+            gdf_type = type(self.gdf)
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(_fit_and_get_z0, d, self.data, gdf_type, kwargs): d
+                    for d in all_points
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        datum, z0_val = future.result()
+                        self.search_results['datum'].append(datum)
+                        self.search_results['z0'].append(z0_val)
+                        self.search_results['success'].append(True)
+                    except Exception as e:
+                        datum = futures[future]
+                        self.logger.warning(f"Parallel sub-fit failed for datum={datum}: {e}")
+                        self.search_results['datum'].append(datum)
+                        self.search_results['z0'].append(np.nan)
+                        self.search_results['success'].append(False)
+
+            # Sort results by datum value for consistent ordering
+            sort_idx = np.argsort(self.search_results['datum'])
+            self.search_results['datum'] = list(np.array(self.search_results['datum'])[sort_idx])
+            self.search_results['z0'] = list(np.array(self.search_results['z0'])[sort_idx])
+            self.search_results['success'] = list(np.array(self.search_results['success'])[sort_idx])
+
+            # Remove any NaN results from failed fits
+            valid = [i for i, s in enumerate(self.search_results['success']) if s]
+            self.search_results['datum'] = [self.search_results['datum'][i] for i in valid]
+            self.search_results['z0'] = [self.search_results['z0'][i] for i in valid]
+            self.search_results['success'] = [self.search_results['success'][i] for i in valid]
+
+            self.logger.info(f"Parallel scan complete: {len(self.search_results['datum'])} successful fits.")
+
+        except Exception as e:
+            self._add_error(f"Parallel scanning intervals failed: {e}")
+            return
+
 
     def _generate_search_points(self, direction: str) -> np.ndarray:
         self.logger.debug(f"Generating search points in {direction} direction...")
@@ -418,27 +485,38 @@ class DataIntervals:
             sparse_points = np.linspace(dense_end, end, sparse_n)
         return np.unique(np.concatenate([dense_points, sparse_points]))
 
-    def _compute_z0_with_extended_datum(self, datum: float) -> float:
-        self.logger.info(f"Computing Z0 with extended datum: {datum:.4f}")
-        # Extend data and fit new GDF, return z0
-        extended_data = np.append(self.data, datum)
-        gdf_type = type(self.gdf)
-        # Single path (gdf_recompute removed): always pass bounds and appropriate S
+    def _build_sub_fit_kwargs(self) -> dict:
+        """Build kwargs for sub-fit GDF instances used in interval scanning."""
+        # Adaptive n_points: enough for Z0 estimation, not full smooth curves
+        n_points_fit = min(200, max(len(self.data) * 3, 50))
+
         kwargs = {
             'LB': self.LB,
             'UB': self.UB,
             'S': self.S_gldf if getattr(self, 'S_gldf', None) is not None else self.S,
             'verbose': False,
-            'flush': True,
+            'flush': False,
+            'catch': False,
             'opt_method': self.opt_method,
-            'n_points': self.n_points_gdf,
+            'n_points': n_points_fit,
             'wedf': self.wedf,
             'homogeneous': self.homogeneous,
             'z0_optimize': self.z0_optimize,
             'max_data_size': self.max_data_size,
-            'tolerance': self.tolerance,
+            'tolerance': self.tolerance * 5,
         }
-            
+        # Pass DLB/DUB if available to skip re-estimation
+        if self.DLB is not None:
+            kwargs['DLB'] = self.DLB
+        if self.DUB is not None:
+            kwargs['DUB'] = self.DUB
+        return kwargs
+
+    def _compute_z0_with_extended_datum(self, datum: float) -> float:
+        self.logger.info(f"Computing Z0 with extended datum: {datum:.4f}")
+        extended_data = np.append(self.data, datum)
+        gdf_type = type(self.gdf)
+        kwargs = self._build_sub_fit_kwargs()
         gdf_new = gdf_type(**kwargs)
         gdf_new.fit(data=extended_data, plot=False)
         return float(gdf_new.z0)
@@ -446,7 +524,7 @@ class DataIntervals:
     def _check_convergence(self) -> bool:
         self.logger.info("Checking convergence of Z0...")
         z0s = np.array(self.search_results['z0'])
-        if len(z0s) < self.convergence_window + self.min_search_points:
+        if len(z0s) < max(self.convergence_window, self.min_search_points):
             return False
         window = z0s[-self.convergence_window:]
         if np.std(window) < self.convergence_threshold:

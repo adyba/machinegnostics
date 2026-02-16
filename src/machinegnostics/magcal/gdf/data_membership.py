@@ -14,6 +14,7 @@ Machine Gnostics
 
 '''
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from machinegnostics.magcal.util.logging import get_logger
 import numpy as np
 import matplotlib.pyplot as plt
@@ -74,20 +75,22 @@ class DataMembership:
         >>> print(results)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  gdf: EGDF,
                  verbose: bool = False,
                  catch: bool = True,
                  tolerance: float = 1e-3,
                  max_iterations: int = 100,
-                 initial_step_factor: float = 0.001):
-        
+                 initial_step_factor: float = 0.001,
+                 parallel: bool = False):
+
         self.gdf = gdf
         self.verbose = verbose
         self.catch = catch
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         self.initial_step_factor = initial_step_factor
+        self.parallel = parallel
         
         # Set up logger
         self.logger = get_logger(self.__class__.__name__, logging.DEBUG if verbose else logging.WARNING)
@@ -174,109 +177,136 @@ class DataMembership:
             self._append_error(error_msg, type(e).__name__)
             raise
     
+    def _build_sub_fit_kwargs(self) -> dict:
+        """Build optimized kwargs for sub-fit EGDF instances used in membership testing."""
+        # Adaptive n_points: enough for PDF shape analysis, not full smooth curves
+        n_points_fit = min(200, max(len(self.gdf.data) * 3, 50))
+
+        kwargs = {
+            'S': self.gdf.S,     # Must use original S (often 'auto') so each sub-fit
+                                 # re-estimates S from extended data. Using S_opt skips
+                                 # re-estimation and makes the homogeneity test less
+                                 # sensitive, producing false positives on skewed data.
+            'verbose': False,
+            'catch': True,              # Required: DataHomogeneity reads pdf_points
+            'flush': False,             # Changed: no cleanup overhead
+            'z0_optimize': self.gdf.z0_optimize,
+            'tolerance': self.gdf.tolerance * 5,  # Changed: relaxed for sub-fits
+            'data_form': self.gdf.data_form,
+            'n_points': n_points_fit,   # Changed: adaptive, was self.gdf.n_points (1000+)
+            'homogeneous': self.gdf.homogeneous,
+            'opt_method': self.gdf.opt_method,
+            'max_data_size': self.gdf.max_data_size,
+            'wedf': self.gdf.wedf,
+            'weights': None,
+        }
+        # NOTE: Do NOT pass parent DLB/DUB here. The sub-fit must re-estimate
+        # bounds from the extended data, otherwise the homogeneity test gets
+        # constrained to the parent's data range and produces false positives
+        # for points far outside it.
+        return kwargs
+
     def _test_membership_at_point(self, test_point: float) -> bool:
         self.logger.debug(f"Testing membership at point: {test_point:.6f}")
         try:
             extended_data = np.append(self.gdf.data, test_point)
-            
-            extended_egdf = EGDF(S=self.gdf.S,
-                                 verbose=False,
-                                 catch=True,
-                                 flush=True,
-                                 z0_optimize=self.gdf.z0_optimize,
-                                 tolerance=self.gdf.tolerance,
-                                 data_form=self.gdf.data_form,
-                                 n_points=self.gdf.n_points,
-                                 homogeneous=self.gdf.homogeneous,
-                                 opt_method=self.gdf.opt_method,
-                                 max_data_size=self.gdf.max_data_size,
-                                 wedf=self.gdf.wedf,
-                                 weights=None)
+
+            kwargs = self._build_sub_fit_kwargs()
+            extended_egdf = EGDF(**kwargs)
             extended_egdf.fit(data=extended_data, plot=False)
 
             homogeneity = DataHomogeneity(
                 gdf=extended_egdf,
                 verbose=False,
-                catch=True
+                catch=False
             )
             is_homogeneous = homogeneity.fit()
-            
+
             return is_homogeneous
-            
+
         except Exception as e:
             self.logger.error(f"Error testing point {test_point:.6f}: {str(e)}")
             return False
     
     def _calculate_adaptive_step(self, data_range: float, iteration: int) -> float:
+        """Deprecated: kept for backward compatibility. Binary search is now used instead."""
         self.logger.debug(f"Calculating adaptive step size at iteration {iteration}")
         base_step = data_range * self.initial_step_factor
         decay_factor = 1.0 / (1.0 + 0.1 * iteration)
         return base_step * decay_factor
-    
+
     def _find_sample_bound(self, bound_type: str) -> Optional[float]:
-        self.logger.info(f"Finding {bound_type} sample bound")
+        """Find a sample bound using binary search.
+
+        Uses monotonicity of homogeneity: if a point is homogeneous, all points
+        closer to the data center are also homogeneous. This allows binary search
+        between the data boundary (search_start) and the universe boundary (search_end),
+        converging in ~log2(range/tolerance) iterations instead of ~100.
+        """
+        self.logger.info(f"Finding {bound_type} sample bound (binary search)")
         if bound_type not in ['lower', 'upper']:
             self.logger.error("Invalid bound_type")
             raise ValueError("bound_type must be either 'lower' or 'upper'")
-        
-        data_range = self.gdf.DUB - self.gdf.DLB
-        
+
         if bound_type == 'lower':
             search_start = self.gdf.DLB
-            search_end = self.gdf.LB if self.gdf.LB is not None else self.gdf.DLB - data_range
+            search_end = self.gdf.LB if self.gdf.LB is not None else self.gdf.DLB - (self.gdf.DUB - self.gdf.DLB)
             direction = "LSB"
-            move_direction = -1
         else:
             search_start = self.gdf.DUB
-            search_end = self.gdf.UB if self.gdf.UB is not None else self.gdf.DUB + data_range
+            search_end = self.gdf.UB if self.gdf.UB is not None else self.gdf.DUB + (self.gdf.DUB - self.gdf.DLB)
             direction = "USB"
-            move_direction = 1
 
-        self.logger.info(f"Searching for {direction} from {search_start:.6f} towards {search_end:.6f}")
+        self.logger.info(f"Searching for {direction}: search_start={search_start:.6f}, search_end={search_end:.6f}")
 
-        # Check if the starting point (data boundary) is homogeneous
-        first_test = self._test_membership_at_point(search_start)
-        
-        if not first_test:
-            # If data boundary itself is not homogeneous, return the data boundary
+        # Phase 1: Test search_start (data boundary) — return immediately if not homogeneous
+        if not self._test_membership_at_point(search_start):
             self.logger.info(f"Data boundary {search_start:.6f} is not homogeneous")
             self.logger.info(f"{direction} = {search_start:.6f} (data boundary)")
             return search_start
-        
-        current_point = search_start
-        best_bound = search_start
-        step_size = self._calculate_adaptive_step(data_range, 0)
-        
-        for iteration in range(self.max_iterations):
-            current_point += move_direction * step_size
-            
-            # Check bounds
-            if bound_type == 'lower' and current_point <= search_end:
-                break
-            if bound_type == 'upper' and current_point >= search_end:
-                break
-            
-            is_homogeneous = self._test_membership_at_point(current_point)
 
-            if iteration % 10 == 0:
-                self.logger.info(f"{direction} iteration {iteration}: "
-                                 f"testing point {current_point:.6f} (homogeneous: {is_homogeneous})")
+        # Phase 2: Test search_end (universe boundary) — if homogeneous, entire range qualifies
+        if self._test_membership_at_point(search_end):
+            self.logger.info(f"Universe boundary {search_end:.6f} is homogeneous")
+            self.logger.info(f"{direction} = {search_end:.6f} (universe boundary)")
+            return search_end
+
+        # Phase 3: Binary search between search_start (homogeneous) and search_end (not homogeneous)
+        # lo = last known homogeneous point, hi = last known non-homogeneous point
+        lo = search_start
+        hi = search_end
+        iteration = 0
+
+        while abs(hi - lo) > self.tolerance and iteration < self.max_iterations:
+            mid = (lo + hi) / 2.0
+            is_homogeneous = self._test_membership_at_point(mid)
+
+            self.logger.debug(f"{direction} iteration {iteration}: "
+                              f"lo={lo:.6f}, hi={hi:.6f}, mid={mid:.6f} (homogeneous: {is_homogeneous})")
 
             if is_homogeneous:
-                best_bound = current_point
-                # Adaptive step size
-                step_size = self._calculate_adaptive_step(data_range, iteration)
+                lo = mid  # extend the homogeneous range
             else:
-                # Found the boundary where homogeneity is lost
-                break
-        
-        if best_bound is not None:
-            self.logger.info(f"Found {direction} = {best_bound:.6f} after {iteration + 1} iterations")
-        else:
-            warning_msg = f"Could not find {direction} within search range"
-            self._append_warning(warning_msg)
-        
-        return best_bound
+                hi = mid  # shrink the search range
+
+            iteration += 1
+
+        self.logger.info(f"Found {direction} = {lo:.6f} after {iteration} iterations (binary search)")
+        return lo
+
+    def _find_bounds_parallel(self) -> Tuple[Optional[float], Optional[float]]:
+        """Run lower and upper bound searches concurrently using threads.
+
+        Thread-safe because each search creates independent EGDF/DataHomogeneity
+        instances and only reads from self.gdf (never mutated during search).
+        """
+        self.logger.info("Finding LSB and USB in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_lsb = executor.submit(self._find_sample_bound, 'lower')
+            future_usb = executor.submit(self._find_sample_bound, 'upper')
+            lsb = future_lsb.result()
+            usb = future_usb.result()
+        return lsb, usb
     
     def fit(self) -> Tuple[Optional[float], Optional[float]]:
         """
@@ -301,11 +331,13 @@ class DataMembership:
 
             self.logger.info("Original sample is homogeneous. Proceeding with bound search...")
 
-            self.logger.info("Finding Lower Sample Bound (LSB)...")
-            self.LSB = self._find_sample_bound('lower')
-
-            self.logger.info("Finding Upper Sample Bound (USB)...")
-            self.USB = self._find_sample_bound('upper')
+            if self.parallel:
+                self.LSB, self.USB = self._find_bounds_parallel()
+            else:
+                self.logger.info("Finding Lower Sample Bound (LSB)...")
+                self.LSB = self._find_sample_bound('lower')
+                self.logger.info("Finding Upper Sample Bound (USB)...")
+                self.USB = self._find_sample_bound('upper')
             
             if self.catch:
                 self.params.update({
@@ -316,7 +348,8 @@ class DataMembership:
                     'search_parameters': {
                         'tolerance': self.tolerance,
                         'max_iterations': self.max_iterations,
-                        'initial_step_factor': self.initial_step_factor
+                        'search_strategy': 'binary',
+                        'parallel': self.parallel
                     }
                 })
             
@@ -543,4 +576,5 @@ class DataMembership:
     def __repr__(self):
         return (f"<DataMembership(fitted={self._fitted}, "
                 f"LSB={self.LSB}, USB={self.USB}, "
-                f"is_homogeneous={self.is_homogeneous})>")
+                f"is_homogeneous={self.is_homogeneous}, "
+                f"search=binary, parallel={self.parallel})>")

@@ -150,7 +150,9 @@ class IntervalAnalysis:
                 extrema_search_tolerance: float = 0.000001,
                 gnostic_filter: bool = False,
                 cluster_bounds: bool = True,
-                membership_bounds: bool = True
+                membership_bounds: bool = True,
+                parallel: bool = False,
+                max_workers: int = None
                 ):
         
         self.DLB = DLB
@@ -181,6 +183,8 @@ class IntervalAnalysis:
         self.gnostic_filter = gnostic_filter
         self.cluster_bounds = cluster_bounds
         self.membership_bounds = membership_bounds
+        self.parallel = parallel
+        self.max_workers = max_workers
         self._fitted = False
 
         self.params = {}
@@ -258,7 +262,7 @@ class IntervalAnalysis:
         # membership bounds if required
         if self.membership_bounds:
             self.logger.info("Estimating data membership bounds...")
-            self._data_membership = DataMembership(gdf=self._egdf, verbose=self.verbose, catch=self.catch)
+            self._data_membership = DataMembership(gdf=self._egdf, verbose=self.verbose, catch=self.catch, parallel=self.parallel)
             self.LSB, self.USB = self._data_membership.fit()
             if self.catch:
                 self.params['DataMembership'] = self._data_membership.params.copy()
@@ -440,7 +444,9 @@ class IntervalAnalysis:
                     'gnostic_filter': self.gnostic_filter,
                     'catch': self.catch,
                     'verbose': self.verbose,
-                    'flush': self.flush
+                    'flush': self.flush,
+                    'parallel': self.parallel,
+                    'max_workers': self.max_workers
                         }
             self._intv_engine = DataIntervals(**di_kwargs)
             self._intv_engine.fit()

@@ -267,6 +267,6 @@ class PolynomialRegressor(HistoryRegressorBase, DataProcessLayerBase):
     def __repr__(self):
         """String representation of the PolynomialRegressor instance."""
         return (f"PolynomialRegressor(degree={self.degree}, max_iter={self.max_iter}, "
-                f"tol={self.tol}, mg_loss='{self.mg_loss}', early_stopping={self.early_stopping}, "
+                f"tol={self.tolerance}, mg_loss='{self.mg_loss}', early_stopping={self.early_stopping}, "
                 f"verbose={self.verbose}, scale={self.scale}, data_form='{self.data_form}', "
                 f"gnostic_characteristics={self.gnostic_characteristics}, history={self._record_history})")
